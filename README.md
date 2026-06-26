@@ -1,115 +1,92 @@
-#[cfg(test)]
-mod tests {
+# AgroFlow
 
-// AgroFlow contract test suite.
-// Exactly 5 tests covering happy path, edge case failure,
-// state verification, cancellation, and double-confirm protection.
+Instant, trustless payments for smallholder farmers — built on Stellar/Soroban.
 
-use crate::*;
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{token, Address, Env};
+## Problem
+Rosa, a rice farmer in Nueva Ecija, Philippines, sells her harvest through a middleman trader who pays 30–45 days after pickup and deducts an undisclosed "handling fee," forcing her to borrow at high interest just to fund the next planting season.
 
-// Helper: deploys a mock USDC token contract and returns
-// (token_address, token_admin_client) so tests can mint balances.
-fn create_token_contract(env: &Env, admin: &Address) -> (Address, token::StellarAssetClient) {
-    let contract_address = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let admin_client = token::StellarAssetClient::new(env, &contract_address);
-    (contract_address, admin_client)
-}
+## Solution
+A buyer locks USDC into a Soroban escrow contract when placing an order. Once the cooperative officer confirms delivery on-chain, the contract instantly releases the USDC to the farmer's wallet — no middleman delay, no trust required between buyer and farmer, and fees low enough that even a $40 sack-of-rice payment makes sense.
 
-fn setup() -> (
-    Env,
-    AgroFlowContractClient<'static>,
-    Address, // buyer
-    Address, // farmer
-    Address, // coop officer
-    token::Client<'static>,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
+## Timeline
+- **Day 1:** Contract design + `lib.rs` escrow logic
+- **Day 2:** Tests, local testnet deployment, CLI demo flow
+- **Day 3:** Mobile-first frontend wiring + cooperative officer confirmation UX
+- **Day 4:** Polish, demo rehearsal, submission
 
-    let admin = Address::generate(&env);
-    let buyer = Address::generate(&env);
-    let farmer = Address::generate(&env);
-    let coop_officer = Address::generate(&env);
+## Stellar Features Used
+- **USDC transfers** — the actual value moved between buyer, contract, and farmer
+- **Soroban smart contracts** — escrow logic enforcing the Locked → Released state machine
+- **Trustlines** — farmers and buyers establish a USDC trustline to hold/receive funds
 
-    let (usdc_address, usdc_admin) = create_token_contract(&env, &admin);
-    let usdc_client = token::Client::new(&env, &usdc_address);
+## Vision and Purpose
+AgroFlow exists to remove the single biggest financial stressor for smallholder farmers: payment delay. By replacing a 30–45 day trust-based wait with an instant, contract-enforced payout, farmers gain predictable cash flow to reinvest in the next planting cycle without resorting to high-interest informal lending. The same escrow pattern generalizes to any cooperative-mediated agricultural supply chain across Southeast Asia.
 
-    // Mint 1000 USDC (in stroops, 7 decimals assumed -> use raw units for test simplicity)
-    usdc_admin.mint(&buyer, &1000);
+## Prerequisites
+- Rust (`rustup` recommended, stable toolchain)
+- `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
+- Soroban CLI v21.0.0 or later: `cargo install --locked soroban-cli`
 
-    let contract_id = env.register(AgroFlowContract, ());
-    let client = AgroFlowContractClient::new(&env, &contract_id);
-    client.initialize(&usdc_address, &coop_officer);
+## How to Build
+```bash
+soroban contract build
+```
+This produces the optimized Wasm binary at `target/wasm32-unknown-unknown/release/agroflow.wasm`.
 
-    (env, client, buyer, farmer, coop_officer, usdc_client)
-}
+## How to Test
+```bash
+cargo test
+```
+Runs the 5-test suite covering the happy path, double-confirmation rejection, post-confirmation state verification, buyer cancellation/refund, and zero-amount rejection.
 
-#[test]
-fn test_happy_path_full_escrow_flow() {
-    // Test 1: MVP transaction executes successfully end-to-end.
-    let (_, client, buyer, farmer, _coop, usdc) = setup();
+## How to Deploy to Testnet
+```bash
+soroban contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/agroflow.wasm \
+  --source <YOUR_ACCOUNT> \
+  --network testnet
+```
 
-    let order_id = client.create_order(&buyer, &farmer, &200);
-    assert_eq!(usdc.balance(&farmer), 0);
+## Sample CLI Invocation (MVP function with dummy arguments)
+```bash
+# Initialize the contract (run once after deploy)
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <YOUR_ACCOUNT> \
+  --network testnet \
+  -- initialize \
+  --usdc_token <USDC_TOKEN_CONTRACT_ID> \
+  --coop_officer <COOP_OFFICER_ADDRESS>
 
-    client.confirm_delivery(&order_id);
+# Buyer creates an order, locking 200 USDC for the farmer
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <BUYER_ACCOUNT> \
+  --network testnet \
+  -- create_order \
+  --buyer <BUYER_ADDRESS> \
+  --farmer <FARMER_ADDRESS> \
+  --amount 200
 
-    assert_eq!(usdc.balance(&farmer), 200);
-    assert_eq!(usdc.balance(&buyer), 800);
-}
+# Cooperative officer confirms delivery, releasing funds to the farmer
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <COOP_OFFICER_ACCOUNT> \
+  --network testnet \
+  -- confirm_delivery \
+  --order_id 0
+```
 
-#[test]
-#[should_panic(expected = "order not in Locked status")]
-fn test_cannot_confirm_already_released_order() {
-    // Test 2: Edge case - confirming a non-Locked (already released) order fails.
-    let (_, client, buyer, farmer, _coop, _usdc) = setup();
+## License
+MIT
 
-    let order_id = client.create_order(&buyer, &farmer, &150);
-    client.confirm_delivery(&order_id);
-    // Second confirmation attempt on the same order must panic.
-    client.confirm_delivery(&order_id);
-}
+## Deployed Contract
 
-#[test]
-fn test_state_reflects_released_status_after_confirmation() {
-    // Test 3: Storage state verification after MVP transaction.
-    let (_, client, buyer, farmer, _coop, _usdc) = setup();
-
-    let order_id = client.create_order(&buyer, &farmer, &300);
-    let order_before = client.get_order(&order_id);
-    assert_eq!(order_before.status, OrderStatus::Locked);
-    assert_eq!(order_before.amount, 300);
-
-    client.confirm_delivery(&order_id);
-
-    let order_after = client.get_order(&order_id);
-    assert_eq!(order_after.status, OrderStatus::Released);
-    assert_eq!(order_after.farmer, farmer);
-    assert_eq!(order_after.buyer, buyer);
-}
-
-#[test]
-fn test_buyer_can_cancel_locked_order_and_get_refund() {
-    // Test 4: Buyer cancels before delivery confirmation; funds return to buyer.
-    let (_, client, buyer, farmer, _coop, usdc) = setup();
-
-    let order_id = client.create_order(&buyer, &farmer, &400);
-    assert_eq!(usdc.balance(&buyer), 600);
-
-    client.cancel_order(&order_id);
-
-    assert_eq!(usdc.balance(&buyer), 1000);
-    let order = client.get_order(&order_id);
-    assert_eq!(order.status, OrderStatus::Cancelled);
-}
-
-#[test]
-#[should_panic(expected = "amount must be positive")]
-fn test_create_order_rejects_zero_amount() {
-    // Test 5: Edge case - zero/invalid amount must be rejected at creation.
-    let (_, client, buyer, farmer, _coop, _usdc) = setup();
-    client.create_order(&buyer, &farmer, &0);
-}
-}
+| Field | Value |
+|-------|-------|
+| Contract ID | `CA7X2VIJYV5DDJZ7DG44AA6RUVVKF6FPDVAFSOCGUSVCSZYPJXNNYJ7T` |
+| Network | testnet |
+| Explorer | [View on stellar.expert](https://stellar.expert/explorer/testnet/contract/CA7X2VIJYV5DDJZ7DG44AA6RUVVKF6FPDVAFSOCGUSVCSZYPJXNNYJ7T) |
+| Deploy Tx | [View transaction](https://stellar.expert/explorer/testnet/tx/bdcae085735424ffac1c308382c11385870e4da25d1a5cd0b24fa9ea1b1b9ce8) |
+| Deployed | 2026-06-26 06:49:04 UTC |
+| Wallet | freighter (`GBBB…BARE`) |
